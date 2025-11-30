@@ -19,7 +19,7 @@ def compute_soft_thresholded_diff(x: torch.Tensor, quantile: float, epsilon: flo
         The difference between the input and the soft-thresholded output (the thresholded component).
     """
 
-    threshold = torch.quantile(x.flatten().float(), quantile) + epsilon
+    threshold = torch.quantile(x.flatten().float(), quantile, interpolation="linear") + epsilon
     o = torch.sign(x) * F.relu(torch.abs(x) - threshold)
     b = x - o
     return b
