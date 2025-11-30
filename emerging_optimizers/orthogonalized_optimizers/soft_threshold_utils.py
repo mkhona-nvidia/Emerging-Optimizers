@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 
-def compute_soft_thresholded_diff(x: torch.Tensor, quantile: float, epsilon: float) -> torch.Tensor:
+def compute_soft_thresholded_diff(x: torch.Tensor, quantile: float, epsilon: float = 1e-9) -> torch.Tensor:
     """Compute the difference between input and its soft-thresholded version.
 
     Applies soft thresholding where the threshold is set to the quantile
