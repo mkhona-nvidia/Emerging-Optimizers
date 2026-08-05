@@ -16,7 +16,7 @@ import torch
 from absl import flags, logging
 from absl.testing import absltest, parameterized
 
-from emerging_optimizers.soap.okls import OKLS
+from emerging_optimizers.soap.okls import OKLS, OKLSPrecisionT, _pack_sym, _unpack_sym
 
 
 flags.DEFINE_enum("device", "cpu", ["cpu", "cuda"], "Device to run tests on")
@@ -33,29 +33,39 @@ def setUpModule() -> None:
 
 
 class OKLSTest(parameterized.TestCase):
-    def test_step_initializes_state_and_updates_parameter(self) -> None:
+    def test_symmetric_pack_round_trip(self) -> None:
+        matrix = torch.randn(2, 4, 4)
+        matrix = (matrix + matrix.mT) / 2
+
+        packed = _pack_sym(matrix)
+
+        self.assertEqual(packed.shape, (2, 10))
+        torch.testing.assert_close(_unpack_sym(packed, 4), matrix)
+
+    @parameterized.product(fp32_matmul_prec=["mixed", "high", "highest"])
+    def test_step_initializes_state_and_updates_parameter(self, fp32_matmul_prec: OKLSPrecisionT) -> None:
         if FLAGS.device != "cuda":
             self.skipTest("OKLS requires CUDA")
 
         param = torch.nn.Parameter(torch.randn(4, 3, device=FLAGS.device))
         original = param.detach().clone()
         param.grad = torch.randn_like(param)
-        optimizer = OKLS([param], lr=0.01, ridge_eps=1e-9)
+        optimizer = OKLS([param], lr=0.01, ridge_eps=1e-9, fp32_matmul_prec=fp32_matmul_prec)
 
         optimizer.step()
 
         self.assertEqual(optimizer.weight_decay_method, "decoupled")
-        self.assertEqual(optimizer.cans_fp32_matmul_prec, "high")
+        self.assertEqual(optimizer.fp32_matmul_prec, fp32_matmul_prec)
         self.assertNotIn("lr_peak", optimizer.param_groups[0])
         self.assertFalse(torch.equal(param, original))
         self.assertTrue(torch.isfinite(param).all())
         state = optimizer.state[param]
         self.assertEqual(state["step"], 1)
         self.assertCountEqual(state.keys(), ["step", "exp_avg", "L", "R", "P_L", "P_R"])
-        self.assertEqual(state["L"].shape, (4, 4))
-        self.assertEqual(state["R"].shape, (3, 3))
-        self.assertEqual(state["P_L"].shape, (4, 4))
-        self.assertEqual(state["P_R"].shape, (3, 3))
+        self.assertEqual(state["L"].shape, (10,))
+        self.assertEqual(state["R"].shape, (6,))
+        self.assertEqual(state["P_L"].shape, (10,))
+        self.assertEqual(state["P_R"].shape, (6,))
         for value in state.values():
             if isinstance(value, torch.Tensor):
                 self.assertEqual(value.dtype, torch.float32)

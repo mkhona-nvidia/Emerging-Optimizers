@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import TYPE_CHECKING, Callable, override
+from typing import TYPE_CHECKING, Callable, Literal, override
 
 
 if TYPE_CHECKING:
@@ -29,14 +29,33 @@ from emerging_optimizers.soap.matrix_root_inverse_utils import mat_root_inv_via_
 from emerging_optimizers.utils import FP32MatmulPrecT
 
 
+OKLSPrecisionT = Literal["highest", "high", "mixed"]
+
+
 __all__ = ["OKLS", "update_kronecker_factors_okls"]
+
+
+def _pack_sym(matrix: torch.Tensor) -> torch.Tensor:
+    """Pack the upper triangle of a symmetric matrix."""
+    dim = matrix.shape[-1]
+    rows, cols = torch.triu_indices(dim, dim, device=matrix.device)
+    return matrix[..., rows, cols]
+
+
+def _unpack_sym(packed: torch.Tensor, dim: int) -> torch.Tensor:
+    """Reconstruct a symmetric matrix from its packed upper triangle."""
+    matrix = torch.empty(packed.shape[:-1] + (dim, dim), dtype=packed.dtype, device=packed.device)
+    rows, cols = torch.triu_indices(dim, dim, device=packed.device)
+    matrix[..., rows, cols] = packed
+    matrix[..., cols, rows] = packed
+    return matrix
 
 
 def _update_inverse_roots(
     kronecker_factor_list: list[torch.Tensor],
     inverse_root_list: list[torch.Tensor],
     ridge_eps: float,
-    cans_fp32_matmul_prec: FP32MatmulPrecT,
+    cans_fp32_matmul_prec: OKLSPrecisionT,
 ) -> None:
     for kronecker_factor, inverse_root in zip(kronecker_factor_list, inverse_root_list, strict=True):
         inverse_root.copy_(
@@ -53,7 +72,7 @@ def _initialize_preconditioners(
     inverse_root_list: list[torch.Tensor],
     grad: torch.Tensor,
     ridge_eps: float,
-    cans_fp32_matmul_prec: FP32MatmulPrecT,
+    cans_fp32_matmul_prec: OKLSPrecisionT,
 ) -> None:
     rows, cols = grad.shape
     grad_norm_sq = grad.square().sum()
@@ -104,12 +123,16 @@ def update_kronecker_factors_okls(
     rows, cols = grad.shape
 
     grad_right_preconditioned = grad @ inverse_root_right
-    factor_left.lerp_(grad_right_preconditioned @ grad_right_preconditioned.T / cols, 1 - shampoo_beta)
+    factor_left.addmm_(
+        grad_right_preconditioned, grad_right_preconditioned.T, beta=shampoo_beta, alpha=(1 - shampoo_beta) / cols
+    )
     factor_left.copy_((factor_left + factor_left.T) / 2.0)
     factor_left.diagonal().add_(ridge_eps)
 
     grad_left_preconditioned = inverse_root_left @ grad
-    factor_right.lerp_(grad_left_preconditioned.T @ grad_left_preconditioned / rows, 1 - shampoo_beta)
+    factor_right.addmm_(
+        grad_left_preconditioned.T, grad_left_preconditioned, beta=shampoo_beta, alpha=(1 - shampoo_beta) / rows
+    )
     factor_right.copy_((factor_right + factor_right.T) / 2.0)
     factor_right.diagonal().add_(ridge_eps)
 
@@ -118,6 +141,9 @@ def update_kronecker_factors_okls(
 class OKLS(opt_mixin.WeightDecayMixin, optim.Optimizer):
     """Online KL-Shampoo with scaled CANS inverse roots and zero-staleness preconditioning.
 
+    Symmetric Kronecker factors and inverse roots are stored as packed upper
+    triangles and reconstructed transiently during each step.
+
     Args:
         params: Iterable of 2D CUDA parameters to optimize or dicts defining parameter groups.
         lr: Learning rate.
@@ -125,8 +151,9 @@ class OKLS(opt_mixin.WeightDecayMixin, optim.Optimizer):
         beta2: KL-Shampoo factor EMA coefficient.
         ridge_eps: Numerical stability offset added to the KL-Shampoo factors.
         weight_decay: Decoupled weight-decay coefficient.
-        cans_fp32_matmul_prec: Precision used for FP32 matrix multiplications in CANS: ``"medium"`` for BF16,
-            ``"high"`` for TF32, or ``"highest"`` for FP32.
+        fp32_matmul_prec: Precision for all matrix multiplications:
+            ``"mixed"`` for FP16 NS GEMMs with TF32 outer matmuls,
+            ``"high"`` for TF32 everywhere, or ``"highest"`` for FP32 everywhere.
     """
 
     def __init__(
@@ -138,10 +165,12 @@ class OKLS(opt_mixin.WeightDecayMixin, optim.Optimizer):
         beta2: float = 0.9482,
         ridge_eps: float = 1e-9,
         weight_decay: float = 0.0,
-        cans_fp32_matmul_prec: FP32MatmulPrecT = "high",
+        fp32_matmul_prec: OKLSPrecisionT = "mixed",
     ) -> None:
         self.weight_decay_method = "decoupled"
-        self.cans_fp32_matmul_prec = cans_fp32_matmul_prec
+        self.fp32_matmul_prec: OKLSPrecisionT = fp32_matmul_prec
+        # Map "mixed" -> "high" for the matmul precision context (TF32 for outer ops).
+        self._ctx_prec: FP32MatmulPrecT = "high" if fp32_matmul_prec == "mixed" else fp32_matmul_prec
 
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -182,10 +211,21 @@ class OKLS(opt_mixin.WeightDecayMixin, optim.Optimizer):
             if len(state) == 0:
                 state["step"] = 0
                 state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
-                state["L"] = p.new_zeros((p.shape[0], p.shape[0]), dtype=torch.float32)
-                state["R"] = p.new_zeros((p.shape[1], p.shape[1]), dtype=torch.float32)
-                state["P_L"] = p.new_zeros((p.shape[0], p.shape[0]), dtype=torch.float32)
-                state["P_R"] = p.new_zeros((p.shape[1], p.shape[1]), dtype=torch.float32)
+                factor_left = p.new_zeros((p.shape[0], p.shape[0]), dtype=torch.float32)
+                factor_right = p.new_zeros((p.shape[1], p.shape[1]), dtype=torch.float32)
+                inverse_root_left = p.new_zeros((p.shape[0], p.shape[0]), dtype=torch.float32)
+                inverse_root_right = p.new_zeros((p.shape[1], p.shape[1]), dtype=torch.float32)
+                _initialize_preconditioners(
+                    [factor_left, factor_right],
+                    [inverse_root_left, inverse_root_right],
+                    p.grad.to(torch.float32),
+                    group["ridge_eps"],
+                    self.fp32_matmul_prec,
+                )
+                state["L"] = _pack_sym(factor_left)
+                state["R"] = _pack_sym(factor_right)
+                state["P_L"] = _pack_sym(inverse_root_left)
+                state["P_R"] = _pack_sym(inverse_root_right)
 
     if TYPE_CHECKING:
 
@@ -206,63 +246,67 @@ class OKLS(opt_mixin.WeightDecayMixin, optim.Optimizer):
         if closure is not None:
             raise ValueError("closure is not supported")
 
-        for group in self.param_groups:
-            self._init_group(group)
+        from emerging_optimizers import utils
 
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    continue  # pragma: no cover
+        with utils.fp32_matmul_precision(self._ctx_prec):
+            for group in self.param_groups:
+                self._init_group(group)
 
-                grad = p.grad.to(torch.float32)
-                state = self.state[p]
-                kronecker_factor_list = [state["L"], state["R"]]
-                inverse_root_list = [state["P_L"], state["P_R"]]
-                ridge_eps = group["ridge_eps"]
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue  # pragma: no cover
 
-                if state["step"] == 0:
-                    _initialize_preconditioners(
+                    grad = p.grad.to(torch.float32)
+                    state = self.state[p]
+                    rows, cols = grad.shape
+                    kronecker_factor_list = [
+                        _unpack_sym(state["L"], rows),
+                        _unpack_sym(state["R"], cols),
+                    ]
+                    inverse_root_list = [
+                        _unpack_sym(state["P_L"], rows),
+                        _unpack_sym(state["P_R"], cols),
+                    ]
+                    ridge_eps = group["ridge_eps"]
+
+                    beta1 = group["beta1"]
+                    state["exp_avg"].lerp_(grad, 1 - beta1)
+                    nesterov_momentum = torch.lerp(grad, state["exp_avg"], beta1)
+
+                    update_kronecker_factors_okls(
+                        kronecker_factor_list=kronecker_factor_list,
+                        inverse_root_list=inverse_root_list,
+                        grad=grad,
+                        shampoo_beta=group["beta2"],
+                        ridge_eps=ridge_eps,
+                    )
+                    _update_inverse_roots(
                         kronecker_factor_list,
                         inverse_root_list,
-                        grad,
                         ridge_eps,
-                        self.cans_fp32_matmul_prec,
+                        self.fp32_matmul_prec,
                     )
+                    state["L"].copy_(_pack_sym(kronecker_factor_list[0]))
+                    state["R"].copy_(_pack_sym(kronecker_factor_list[1]))
+                    state["P_L"].copy_(_pack_sym(inverse_root_list[0]))
+                    state["P_R"].copy_(_pack_sym(inverse_root_list[1]))
 
-                beta1 = group["beta1"]
-                state["exp_avg"].lerp_(grad, 1 - beta1)
-                nesterov_momentum = torch.lerp(grad, state["exp_avg"], beta1)
+                    preconditioned_update = inverse_root_list[0] @ nesterov_momentum @ inverse_root_list[1]
+                    nesterov_variance = ((1 - beta1) / (1 + beta1)) * (1 + 2 * beta1 - 2 * beta1**3)
+                    momentum_scale = nesterov_variance**-0.5
+                    shape_scale = math.sqrt(rows / cols) / (math.sqrt(rows) + math.sqrt(cols))
 
-                update_kronecker_factors_okls(
-                    kronecker_factor_list=kronecker_factor_list,
-                    inverse_root_list=inverse_root_list,
-                    grad=grad,
-                    shampoo_beta=group["beta2"],
-                    ridge_eps=ridge_eps,
-                )
-                _update_inverse_roots(
-                    kronecker_factor_list,
-                    inverse_root_list,
-                    ridge_eps,
-                    self.cans_fp32_matmul_prec,
-                )
-
-                preconditioned_update = inverse_root_list[0] @ nesterov_momentum @ inverse_root_list[1]
-                rows, cols = grad.shape
-                nesterov_variance = ((1 - beta1) / (1 + beta1)) * (1 + 2 * beta1 - 2 * beta1**3)
-                momentum_scale = nesterov_variance**-0.5
-                shape_scale = math.sqrt(rows / cols) / (math.sqrt(rows) + math.sqrt(cols))
-
-                self._apply_weight_decay_inplace(
-                    p,
-                    grad,
-                    group["lr"],
-                    group["weight_decay"],
-                )
-                p.add_(
-                    preconditioned_update.to(p.dtype),
-                    alpha=-group["lr"] * momentum_scale * shape_scale,
-                )
-                state["step"] += 1
+                    self._apply_weight_decay_inplace(
+                        p,
+                        grad,
+                        group["lr"],
+                        group["weight_decay"],
+                    )
+                    p.add_(
+                        preconditioned_update.to(p.dtype),
+                        alpha=-group["lr"] * momentum_scale * shape_scale,
+                    )
+                    state["step"] += 1
 
         return None
