@@ -18,7 +18,7 @@ from absl import flags, logging
 from absl.testing import absltest, parameterized
 
 from emerging_optimizers.soap.matrix_root_inverse_utils import mat_root_inv_via_scaled_cans
-from emerging_optimizers.utils import FP32MatmulPrecT
+from emerging_optimizers.soap.okls import OKLSPrecisionT
 
 
 flags.DEFINE_enum("device", "cpu", ["cpu", "cuda"], "Device to run tests on")
@@ -37,12 +37,12 @@ def setUpModule() -> None:
 class MatrixRootInverseUtilsTest(parameterized.TestCase):
     @parameterized.product(
         shape=[(4, 4), (2, 4, 4)],
-        fp32_matmul_prec=["medium", "high", "highest"],
+        fp32_matmul_prec=["mixed", "high", "highest"],
     )
     def test_mat_root_inv_via_scaled_cans_smoke(
         self,
         shape: tuple[int, ...],
-        fp32_matmul_prec: FP32MatmulPrecT,
+        fp32_matmul_prec: OKLSPrecisionT,
     ) -> None:
         x = torch.randn(*shape, device=FLAGS.device)
         matrix = x @ x.mT + 0.1 * torch.eye(shape[-1], device=FLAGS.device)
@@ -54,8 +54,15 @@ class MatrixRootInverseUtilsTest(parameterized.TestCase):
         self.assertEqual(inverse_root.dtype, torch.float32)
         self.assertEqual(torch.get_float32_matmul_precision(), previous_precision)
 
-    @parameterized.parameters((8, 8), (16, 16), (2, 8, 8), (3, 16, 16))  # type: ignore[misc]
-    def test_mat_root_inv_via_scaled_cans_accuracy(self, shape: tuple[int, ...]) -> None:
+    @parameterized.product(
+        shape=[(8, 8), (16, 16), (2, 8, 8), (3, 16, 16)],
+        fp32_matmul_prec=["mixed", "high", "highest"],
+    )
+    def test_mat_root_inv_via_scaled_cans_accuracy(
+        self,
+        shape: tuple[int, ...],
+        fp32_matmul_prec: OKLSPrecisionT,
+    ) -> None:
         matrix_size = shape[-1]
         base_matrix = 2.0 * torch.eye(matrix_size, device=FLAGS.device)
         base_matrix.diagonal(offset=1).fill_(0.25)
@@ -71,14 +78,30 @@ class MatrixRootInverseUtilsTest(parameterized.TestCase):
             ).view(-1, 1, 1)
             matrix = base_matrix.unsqueeze(0) * batch_scale
 
-        inverse_root = mat_root_inv_via_scaled_cans(matrix)
+        inverse_root = mat_root_inv_via_scaled_cans(matrix, fp32_matmul_prec=fp32_matmul_prec)
         whitened_matrix = inverse_root @ matrix @ inverse_root
         matrix_root = torch.linalg.inv(inverse_root)
         reconstructed_matrix = matrix_root @ matrix_root
+        accuracy_tolerance = 2e-4 if fp32_matmul_prec == "highest" else 2e-2
 
         for whitened_matrix_slice in whitened_matrix.reshape(-1, matrix_size, matrix_size):
-            assert_close_to_identity(whitened_matrix_slice, off_diag_atol=2e-4, diag_atol=2e-4)
-        torch.testing.assert_close(reconstructed_matrix, matrix, atol=2e-4, rtol=2e-4)
+            assert_close_to_identity(
+                whitened_matrix_slice,
+                off_diag_atol=accuracy_tolerance,
+                diag_atol=accuracy_tolerance,
+            )
+        if fp32_matmul_prec == "highest":
+            torch.testing.assert_close(
+                reconstructed_matrix,
+                matrix,
+                atol=accuracy_tolerance,
+                rtol=accuracy_tolerance,
+            )
+        else:
+            relative_reconstruction_error = torch.linalg.vector_norm(
+                reconstructed_matrix - matrix
+            ) / torch.linalg.vector_norm(matrix)
+            self.assertLess(relative_reconstruction_error.item(), accuracy_tolerance)
 
     def test_mat_root_inv_via_scaled_cans_rejects_non_fp32_tensor(self) -> None:
         with self.assertRaisesRegex(TypeError, "must be in float32"):
